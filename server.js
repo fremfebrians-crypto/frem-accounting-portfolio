@@ -13,7 +13,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+app.set('trust proxy', 1);
+
 const PORT = Number(process.env.PORT || 3000);
+const isProduction = process.env.NODE_ENV === 'production';
 
 const {
   BASE_URL = `http://localhost:${PORT}`,
@@ -29,16 +32,19 @@ const {
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
 app.use(
   session({
     name: 'frem.sid',
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
+    proxy: true,
+    unset: 'destroy',
     cookie: {
       httpOnly: true,
       sameSite: 'lax',
-      secure: process.env.NODE_ENV === 'production',
+      secure: isProduction,
       maxAge: 1000 * 60 * 60 * 24 * 14,
     },
   })
@@ -46,7 +52,11 @@ app.use(
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-const LINKEDIN_SCOPES = ['openid', 'profile', 'email'];
+// Safer default for LinkedIn OIDC.
+// If your LinkedIn app explicitly supports email scope, you can change this to:
+// ['openid', 'profile', 'email']
+const LINKEDIN_SCOPES = ['openid', 'profile'];
+
 const LINKEDIN_AUTHORIZE_URL = 'https://www.linkedin.com/oauth/v2/authorization';
 const LINKEDIN_TOKEN_URL = 'https://www.linkedin.com/oauth/v2/accessToken';
 
@@ -58,10 +68,12 @@ async function getGoogleCredentials() {
   if (GOOGLE_SERVICE_ACCOUNT_JSON) {
     return JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
   }
+
   if (GOOGLE_SERVICE_ACCOUNT_FILE) {
     const raw = await fs.readFile(GOOGLE_SERVICE_ACCOUNT_FILE, 'utf-8');
     return JSON.parse(raw);
   }
+
   throw new Error('Missing Google service account credentials.');
 }
 
@@ -71,11 +83,15 @@ async function getSheetsClient() {
     credentials,
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
+
   return google.sheets({ version: 'v4', auth });
 }
 
 async function ensureTestimonialsSheet(sheets) {
-  const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId: GOOGLE_SHEET_ID });
+  const spreadsheet = await sheets.spreadsheets.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+  });
+
   const existing = (spreadsheet.data.sheets || []).find(
     (sheet) => sheet.properties && sheet.properties.title === TESTIMONIAL_SHEET_NAME
   );
@@ -118,7 +134,7 @@ async function ensureTestimonialsSheet(sheets) {
           'role',
           'message',
           'profile_url',
-          'site_url'
+          'site_url',
         ]],
       },
     });
@@ -213,16 +229,23 @@ app.get('/auth/linkedin', (req, res) => {
   req.session.oauthState = state;
   req.session.oauthNonce = nonce;
 
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id: LINKEDIN_CLIENT_ID,
-    redirect_uri: getRedirectUri(),
-    scope: LINKEDIN_SCOPES.join(' '),
-    state,
-    nonce,
-  });
+  req.session.save((err) => {
+    if (err) {
+      console.error('Failed to save OAuth session:', err);
+      return res.status(500).send('Unable to start LinkedIn login.');
+    }
 
-  res.redirect(`${LINKEDIN_AUTHORIZE_URL}?${params.toString()}`);
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: LINKEDIN_CLIENT_ID,
+      redirect_uri: getRedirectUri(),
+      scope: LINKEDIN_SCOPES.join(' '),
+      state,
+      nonce,
+    });
+
+    return res.redirect(`${LINKEDIN_AUTHORIZE_URL}?${params.toString()}`);
+  });
 });
 
 app.get('/auth/linkedin/callback', async (req, res) => {
@@ -230,10 +253,15 @@ app.get('/auth/linkedin/callback', async (req, res) => {
     const { code, state, error, error_description } = req.query;
 
     if (error) {
-      return res.status(400).send(`LinkedIn login failed: ${error_description || error}`);
+      return res
+        .status(400)
+        .send(`LinkedIn login failed: ${error_description || error}`);
     }
 
-    if (!code || !state || state !== req.session.oauthState) {
+    const savedState = req.session?.oauthState;
+    const savedNonce = req.session?.oauthNonce;
+
+    if (!code || !state || !savedState || state !== savedState) {
       return res.status(400).send('Invalid login state.');
     }
 
@@ -245,24 +273,32 @@ app.get('/auth/linkedin/callback', async (req, res) => {
       redirect_uri: getRedirectUri(),
     });
 
-    const tokenResponse = await axios.post(LINKEDIN_TOKEN_URL, params.toString(), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    });
+    const tokenResponse = await axios.post(
+      LINKEDIN_TOKEN_URL,
+      params.toString(),
+      {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      }
+    );
 
     const { id_token: idToken, access_token: accessToken } = tokenResponse.data || {};
+
     if (!idToken) {
       return res.status(500).send('LinkedIn did not return an ID token.');
     }
 
     const claims = decodeJwt(idToken);
 
-    if (req.session.oauthNonce && claims.nonce && claims.nonce !== req.session.oauthNonce) {
+    if (savedNonce && claims.nonce && claims.nonce !== savedNonce) {
       return res.status(400).send('Invalid OIDC nonce.');
     }
 
     req.session.user = {
       sub: claims.sub,
-      name: claims.name || [claims.given_name, claims.family_name].filter(Boolean).join(' ') || 'LinkedIn member',
+      name:
+        claims.name ||
+        [claims.given_name, claims.family_name].filter(Boolean).join(' ') ||
+        'LinkedIn member',
       email: claims.email || '',
       picture: claims.picture || '',
       profile: claims.profile || '',
@@ -272,7 +308,14 @@ app.get('/auth/linkedin/callback', async (req, res) => {
     delete req.session.oauthState;
     delete req.session.oauthNonce;
 
-    res.redirect('/#testimonials');
+    req.session.save((err) => {
+      if (err) {
+        console.error('Failed to save login session:', err);
+        return res.status(500).send('Unable to complete LinkedIn login.');
+      }
+
+      return res.redirect('/#testimonials');
+    });
   } catch (error) {
     console.error(error.response?.data || error.message);
     res.status(500).send('Unable to complete LinkedIn login.');
@@ -291,6 +334,7 @@ app.get('/api/me', (req, res) => {
   }
 
   const { sub, name, email, picture, profile } = req.session.user;
+
   res.json({
     authenticated: true,
     user: { sub, name, email, picture, profile },
@@ -313,7 +357,9 @@ app.post('/api/testimonials', requireAuth, async (req, res) => {
     const message = String(req.body.message || '').trim();
 
     if (!role || !message) {
-      return res.status(400).json({ error: 'Role/company and message are required.' });
+      return res
+        .status(400)
+        .json({ error: 'Role/company and message are required.' });
     }
 
     const status = await appendTestimonial({
